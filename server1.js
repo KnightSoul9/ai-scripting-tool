@@ -3,8 +3,6 @@ const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const OpenAI = require('openai');
 const cron = require('node-cron');
-const mongoose = require('mongoose');
-const Tool = require('./models/Tool');
 require('dotenv').config();
 
 const app = express();
@@ -14,12 +12,13 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'ai_tools_db';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const AUTO_PROCESS = process.env.AUTO_PROCESS !== 'false'; // Default: true
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
+// Initialize DeepSeek (using OpenAI SDK with custom base URL)
+const deepseek = new OpenAI({
+  apiKey: DEEPSEEK_API_KEY,
+  baseURL: 'https://api.deepseek.com',
 });
 
 // MongoDB connection
@@ -27,133 +26,74 @@ let db;
 
 async function connectToMongo() {
   try {
-    await mongoose.connect(MONGODB_URI, {
-      dbName: DB_NAME
-    });
-    console.log('Connected to MongoDB');
-    
-    // Initialize the db variable for raw data operations
     const client = new MongoClient(MONGODB_URI);
     await client.connect();
     db = client.db(DB_NAME);
+    console.log('Connected to MongoDB');
   } catch (error) {
     console.error('MongoDB connection error:', error);
     process.exit(1);
   }
 }
 
-// Function to get AI analysis from OpenAI
+// Function to get AI analysis from DeepSeek
 async function getAIAnalysis(toolName, appUrl) {
   try {
-    // Handle undefined/null values
-    const safeName = toolName || 'Unknown Tool';
-    const safeUrl = appUrl || 'No URL provided';
-    
     const prompt = `
     Analyze this AI tool and provide detailed information:
     
-    Tool Name: ${safeName}
-    App URL: ${safeUrl}
+    Tool Name: ${toolName}
+    App URL: ${appUrl}
     
-    IMPORTANT: Return ONLY a valid JSON object, no markdown formatting, no code blocks, no backticks.
-    
-    Provide a JSON response with exactly this structure:
+    Please provide a JSON response with the following structure:
     {
-      "name": "The official name of the tool",
-      "slug": "lowercase-hyphenated-name",
-      "website": "The official website URL",
-      "tagline": "A short, catchy one-line description",
-      "description": "A brief one-sentence description",
-      "company": "The company that owns/develops the tool",
-      "longDescription": "A comprehensive 2-3 paragraph description of the tool's capabilities and value proposition",
-      "categories": [
-        "List of relevant categories this tool belongs to",
-        "Each category should be specific and relevant"
+      "app_description": "A comprehensive description of what this AI tool does and its main purpose",
+      "app_core_features": [
+        "List of key features this tool offers",
+        "Each feature should be concise but descriptive"
       ],
-      "features": [
-        {
-          "name": "Feature name",
-          "description": "Detailed description of the feature"
-        }
+      "app_pros": [
+        "List of advantages and benefits of using this tool",
+        "Focus on what makes it valuable to users"
       ],
-      "integrations": [
-        "List of major integrations and platforms supported"
-      ],
-      "prosCons": {
-        "pros": [
-          "List of advantages and benefits"
-        ],
-        "cons": [
-          "List of potential drawbacks or limitations"
-        ]
-      },
-      "useCases": [
-        "List of specific use cases and applications"
+      "app_cons": [
+        "List of potential drawbacks or limitations",
+        "Be fair and balanced in assessment"
       ]
     }
+    
+    Make sure the response is valid JSON format.
     `;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4",
+    const response = await deepseek.chat.completions.create({
+      model: "deepseek-chat",
       messages: [
-        {
-          role: "system",
-          content: "You are a helpful AI that analyzes tools and returns responses in pure JSON format without any markdown formatting or code blocks."
-        },
         {
           role: "user",
           content: prompt
         }
       ],
-      max_tokens: 2000,
+      max_tokens: 1000,
       temperature: 0.7
     });
 
-    let content = response.choices[0].message.content.trim();
-    
-    // Clean up the response by removing markdown code blocks if present
-    if (content.startsWith('```json')) {
-      content = content.replace(/```json\s*/, '').replace(/```\s*$/, '').trim();
-    } else if (content.startsWith('```')) {
-      content = content.replace(/```\s*/, '').replace(/```\s*$/, '').trim();
-    }
+    const content = response.choices[0].message.content;
     
     // Try to parse JSON response
     try {
-      const parsed = JSON.parse(content);
-      
-      // Validate that required fields exist
-      if (!parsed.name || !parsed.description || !Array.isArray(parsed.features) || 
-          !parsed.prosCons || !Array.isArray(parsed.useCases)) {
-        throw new Error('Invalid JSON structure');
-      }
-      
-      return parsed;
+      return JSON.parse(content);
     } catch (parseError) {
-      console.error('Failed to parse OpenAI response as JSON:', parseError);
-      console.error('Raw content:', content);
-      
+      console.error('Failed to parse DeepSeek response as JSON:', parseError);
       // Return a fallback structure if JSON parsing fails
       return {
-        name: safeName,
-        slug: safeName.toLowerCase().replace(/\s+/g, '-'),
-        website: safeUrl,
-        tagline: `AI tool analysis for ${safeName}`,
-        description: `AI tool analysis for ${safeName}. ${content.substring(0, 200)}...`,
-        company: "Unknown",
-        longDescription: "Analysis pending - JSON parse error",
-        categories: ["AI Tools"],
-        features: [],
-        integrations: [],
-        prosCons: {
-          pros: [],
-          cons: []
-        },
-        useCases: []
+        app_description: content.substring(0, 500) + '...',
+        app_core_features: ['Feature analysis pending'],
+        app_pros: ['Analysis pending'],
+        app_cons: ['Analysis pending']
       };
     }
   } catch (error) {
-    console.error('OpenAI API error:', error);
+    console.error('DeepSeek API error:', error);
     throw error;
   }
 }
@@ -161,38 +101,32 @@ async function getAIAnalysis(toolName, appUrl) {
 // Function to process a single raw data item
 async function processRawDataItem(item) {
   try {
-    // Debug: Log the entire item to see what fields are available
-    console.log('Raw item data:', JSON.stringify(item, null, 2));
+    console.log(`Processing item: ${item.ai_tool_name}`);
     
-    // Handle cases where item properties might be undefined/null
-    const toolName = item.appName || item.ai_tool_name || item.name || item.tool_name || 'Unknown Tool';
-    const appUrl = item.appUrl || item.app_url || item.url || item.website || '';
-    const logoUrl = item.appLogoUrl || item.logo_url || item.logo || item.image_url || '';
+    // Get AI analysis from DeepSeek
+    const aiAnalysis = await getAIAnalysis(item.ai_tool_name, item.app_url);
     
-    console.log(`Processing item: ${toolName} (ID: ${item._id})`);
-    console.log(`App URL: ${appUrl}`);
-    
-    // Get AI analysis from OpenAI
-    const aiAnalysis = await getAIAnalysis(toolName, appUrl);
-    
-    console.log('AI Analysis result:', aiAnalysis);
-    
-    // Create a new tool document using the Mongoose model
-    const tool = new Tool({
-      ...aiAnalysis,
-      logo_url: logoUrl,
+    // Prepare processed data
+    const processedData = {
+      ai_tool_name: item.ai_tool_name,
+      app_url: item.app_url,
+      logo_url: item.logo_url,
+      app_description: aiAnalysis.app_description,
+      app_core_features: aiAnalysis.app_core_features,
+      app_pros: aiAnalysis.app_pros,
+      app_cons: aiAnalysis.app_cons,
       status: 10,
       processed_at: new Date(),
-      original_id: item._id.toString()
-    });
+      original_id: item._id
+    };
     
-    // Save the tool document
-    const savedTool = await tool.save();
-    console.log('Saved tool document:', savedTool._id);
+    // Insert into processed-data collection
+    const processedCollection = db.collection('Processed-test-data');
+    const insertResult = await processedCollection.insertOne(processedData);
     
     // Update status in raw-data collection
     const rawCollection = db.collection('Raw-test-data');
-    const updateResult = await rawCollection.updateOne(
+    await rawCollection.updateOne(
       { _id: item._id },
       { 
         $set: { 
@@ -202,18 +136,15 @@ async function processRawDataItem(item) {
       }
     );
     
-    console.log('Update result:', updateResult.modifiedCount);
-    console.log(`Successfully processed: ${toolName}`);
-    
+    console.log(`Successfully processed: ${item.ai_tool_name}`);
     return {
       success: true,
-      processedId: savedTool._id,
+      processedId: insertResult.insertedId,
       originalId: item._id
     };
     
   } catch (error) {
-    const toolName = item.appName || item.ai_tool_name || item.name || item.tool_name || 'Unknown Tool';
-    console.error(`Error processing item ${toolName}:`, error);
+    console.error(`Error processing item ${item.ai_tool_name}:`, error);
     
     // Update status to indicate error (status = -1)
     const rawCollection = db.collection('Raw-test-data');
@@ -261,7 +192,7 @@ app.post('/process-raw-data', async (req, res) => {
       const result = await processRawDataItem(item);
       results.push(result);
       
-      // Add delay to respect OpenAI rate limits (can be reduced for higher tier accounts)
+      // Add delay to respect DeepSeek rate limits
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
@@ -331,11 +262,12 @@ app.post('/process-item/:id', async (req, res) => {
 app.get('/status', async (req, res) => {
   try {
     const rawCollection = db.collection('Raw-test-data');
+    const processedCollection = db.collection('Processed-test-data');
     
     const pending = await rawCollection.countDocuments({ status: 0 });
     const processed = await rawCollection.countDocuments({ status: 1 });
     const errors = await rawCollection.countDocuments({ status: -1 });
-    const totalProcessed = await Tool.countDocuments();
+    const totalProcessed = await processedCollection.countDocuments();
     
     res.json({
       success: true,
@@ -359,17 +291,19 @@ app.get('/status', async (req, res) => {
 // Route to get processed data
 app.get('/processed-data', async (req, res) => {
   try {
+    const processedCollection = db.collection('Processed-test-data');
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
     
-    const [data, total] = await Promise.all([
-      Tool.find()
-        .sort({ processed_at: -1 })
-        .skip(skip)
-        .limit(limit),
-      Tool.countDocuments()
-    ]);
+    const data = await processedCollection
+      .find({})
+      .sort({ processed_at: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+    
+    const total = await processedCollection.countDocuments();
     
     res.json({
       success: true,
@@ -439,17 +373,16 @@ async function autoProcessPendingData() {
     let failed = 0;
     
     for (const item of pendingItems) {
-      const toolName = item.ai_tool_name || item.name || 'Unknown Tool';
       const result = await processRawDataItem(item);
       if (result.success) {
         processed++;
-        console.log(`✅ Processed: ${toolName} (${processed}/${pendingCount})`);
+        console.log(`✅ Processed: ${item.ai_tool_name} (${processed}/${pendingCount})`);
       } else {
         failed++;
-        console.log(`❌ Failed: ${toolName} - ${result.error}`);
+        console.log(`❌ Failed: ${item.ai_tool_name} - ${result.error}`);
       }
       
-      // Add delay to respect OpenAI rate limits
+      // Add delay to respect DeepSeek rate limits
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
@@ -464,7 +397,7 @@ async function autoProcessPendingData() {
 async function startServer() {
   await connectToMongo();
   
-  const server = app.listen(PORT, async () => {
+  app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/health`);
     console.log(`Process data: POST http://localhost:${PORT}/process-raw-data`);
@@ -489,29 +422,6 @@ async function startServer() {
       console.log('⏸️  Auto-processing disabled. Use POST /process-raw-data to process manually');
     }
   });
-
-  // Handle server errors
-  server.on('error', (error) => {
-    if (error.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is already in use. Please try a different port or close the application using this port.`);
-      process.exit(1);
-    } else {
-      console.error('Server error:', error);
-    }
-  });
 }
-
-// Handle process termination
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Closing server...');
-  mongoose.connection.close();
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Closing server...');
-  mongoose.connection.close();
-  process.exit(0);
-});
 
 startServer().catch(console.error);
